@@ -38,7 +38,7 @@ in your template.
   number-align: center,
 )
 
-#rect(fill: aqua)
+#rect(fill: aqua.lighten(40%))
 ```
 
 This example visualizes the dimensions for page content, headers, and footers.
@@ -174,25 +174,24 @@ conditionally remove the header on the first page:
 
 ```typ
 >>> #set page("a5", margin: (x: 2.5cm, y: 3cm))
-#set page(header: locate(loc => {
-  if counter(page).at(loc).first() > 1 [
+#set page(header: context {
+  if counter(page).get().first() > 1 [
     _Lisa Strassner's Thesis_
     #h(1fr)
     National Academy of Sciences
   ]
-}))
+})
 
 #lorem(150)
 ```
 
-This example may look intimidating, but let's break it down: We are telling
-Typst that the header depends on the current [location]($locate). The `loc`
-value allows other functions to find out where on the page we currently are. We
-then ask Typst if the page [counter]($counter) is larger than one at our current
-position. The page counter starts at one, so we are skipping the header on a
-single page. Counters may have multiple levels. This feature is used for items
-like headings, but the page counter will always have a single level, so we can
-just look at the first one.
+This example may look intimidating, but let's break it down: By using the
+`{context}` keyword, we are telling Typst that the header depends on where we
+are in the document. We then ask Typst if the page [counter] is larger than one
+at our (context-dependent) current position. The page counter starts at one, so
+we are skipping the header on a single page. Counters may have multiple levels.
+This feature is used for items like headings, but the page counter will always
+have a single level, so we can just look at the first one.
 
 You can, of course, add an `else` to this example to add a different header to
 the first page instead.
@@ -201,17 +200,17 @@ the first page instead.
 The technique described in the previous section can be adapted to perform more
 advanced tasks using Typst's labels. For example, pages with big tables could
 omit their headers to help keep clutter down. We will mark our tables with a
-`<big-table>` [label]($label) and use the [query system]($query) to find out if
-such a label exists on the current page:
+`<big-table>` [label] and use the [query system]($query) to find out if such a
+label exists on the current page:
 
 ```typ
 >>> #set page("a5", margin: (x: 2.5cm, y: 3cm))
-#set page(header: locate(loc => {
-  let page-counter = counter(page)
-  let matches = query(<big-table>, loc)
-  let current = page-counter.at(loc)
+#set page(header: context {
+  let page-counter =
+  let matches = query(<big-table>)
+  let current = counter(page).get()
   let has-table = matches.any(m =>
-    page-counter.at(m.location()) == current
+    counter(page).at(m.location()) == current
   )
 
   if not has-table [
@@ -291,7 +290,7 @@ a custom footer with page numbers and more.
 
 ```example
 >>> #set page("iso-b6", margin: 1.75cm)
-#set page(footer: [
+#set page(footer: context [
   *American Society of Proceedings*
   #h(1fr)
   #counter(page).display(
@@ -314,31 +313,29 @@ circle for each page.
 
 ```example
 >>> #set page("iso-b6", margin: 1.75cm)
-#set page(footer: [
+#set page(footer: context [
   *Fun Typography Club*
   #h(1fr)
-  #counter(page).display(num => {
-    let circles = num * (
-      box(circle(
-        radius: 2pt,
-        fill: navy,
-      )),
-    )
-    box(
-      inset: (bottom: 1pt),
-      circles.join(h(1pt))
-    )
-  })
+  #let (num,) = counter(page).get()
+  #let circles = num * (
+    box(circle(
+      radius: 2pt,
+      fill: navy,
+    )),
+  )
+  #box(
+    inset: (bottom: 1pt),
+    circles.join(h(1pt))
+  )
 ])
 
 This page has a custom footer.
 ```
 
 In this example, we use the number of pages to create an array of
-[circles]($circle). The circles are wrapped in a [box]($box) so they can all
-appear on the same line because they are blocks and would otherwise create
-paragraph breaks. The length of this [array]($array) depends on the current page
-number.
+[circles]($circle). The circles are wrapped in a [box] so they can all appear on
+the same line because they are blocks and would otherwise create paragraph
+breaks. The length of this [array] depends on the current page number.
 
 We then insert the circles at the right side of the footer, with 1pt of space
 between them. The join method of an array will attempt to
@@ -355,8 +352,8 @@ want to start with the first page only after the title page. Or maybe you need
 to skip a few page numbers because you will insert pages into the final printed
 product.
 
-The right way to modify the page number is to manipulate the page
-[counter]($counter). The simplest manipulation is to set the counter back to 1.
+The right way to modify the page number is to manipulate the page [counter]. The
+simplest manipulation is to set the counter back to 1.
 
 ```typ
 #counter(page).update(1)
@@ -374,78 +371,71 @@ In this example, we skip five pages. `n` is the current value of the page
 counter and `n + 5` is the return value of our function.
 
 In case you need to retrieve the actual page number instead of the value of the
-page counter, you can use the [`page`]($locate) method on the argument of the
-`{locate}` closure:
+page counter, you can use the [`page`]($location.page) method on the return
+value of the [`here`] function:
 
 ```example
 #counter(page).update(n => n + 5)
 
 // This returns one even though the
 // page counter was incremented by 5.
-#locate(loc => loc.page())
+#context here().page()
 ```
 
-You can also obtain the page numbering pattern from the `{locate}` closure
-parameter with the [`page-numbering`]($locate) method.
+You can also obtain the page numbering pattern from the location returned by
+`here` with the [`page-numbering`]($location.page-numbering) method.
 
 ## Add columns { #columns }
 Add columns to your document to fit more on a page while maintaining legible
 line lengths. Columns are vertical blocks of text which are separated by some
 whitespace. This space is called the gutter.
 
-If all of your content needs to be laid out in columns, you can just specify the
-desired number of columns in the [`{page}`]($page.columns) set rule:
+To lay out your content in columns, just specify the desired number of columns
+in a [`{page}`]($page.columns) set rule. To adjust the amount of space between
+the columns, add a set rule on the [`columns` function]($columns), specifying
+the `gutter` parameter.
 
 ```example
 >>> #set page(height: 120pt)
 #set page(columns: 2)
+#set columns(gutter: 12pt)
+
 #lorem(30)
 ```
 
-If you need to adjust the gutter between the columns, refer to the method used
-in the next section.
-
-### Use columns anywhere in your document { #columns-anywhere }
 Very commonly, scientific papers have a single-column title and abstract, while
-the main body is set in two-columns. To achieve this effect, Typst includes a
-standalone [`{columns}` function]($columns) that can be used to insert columns
-anywhere on a page.
-
-Conceptually, the `columns` function must wrap the content of the columns:
+the main body is set in two-columns. To achieve this effect, Typst's [`place`
+function]($place) can temporarily escape the two-column layout by specifying
+`{float: true}` and `{scope: "parent"}`:
 
 ```example:single
 >>> #set page(height: 180pt)
-= Impacts of Odobenidae
-
+#set page(columns: 2)
 #set par(justify: true)
->>> #h(11pt)
-#columns(2)[
-  == About seals in the wild
-  #lorem(80)
-]
-```
 
-However, we can use the ["everything show rule"]($styling/#show-rules) to reduce
-nesting and write more legible Typst markup:
-
-```example:single
->>> #set page(height: 180pt)
-= Impacts of Odobenidae
-
-#set par(justify: true)
->>> #h(11pt)
-#show: columns.with(2)
+#place(
+  top + center,
+  float: true,
+  scope: "parent",
+  text(1.4em, weight: "bold")[
+    Impacts of Odobenidae
+  ],
+)
 
 == About seals in the wild
 #lorem(80)
 ```
 
-The show rule will wrap everything that comes after it in its function. The
-[`with` method]($function.with) allows us to pass arguments, in this case, the
-column count, to a function without calling it.
+_Floating placement_ refers to elements being pushed to the top or bottom of the
+column or page, with the remaining content flowing in between. It is also
+frequently used for [figures]($figure.placement).
 
-Another use of the `columns` function is to create columns inside of a container
-like a rectangle or to customize gutter size:
+### Use columns anywhere in your document { #columns-anywhere }
+To create columns within a nested layout, e.g. within a rectangle, you can use
+the [`columns` function]($columns) directly. However, it really should only be
+used within nested layouts. At the page-level, the page set rule is preferable
+because it has better interactions with things like page-level floats,
+footnotes, and line numbers.
 
 ```example
 #rect(

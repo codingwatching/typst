@@ -10,36 +10,41 @@ use codespan_reporting::term::{self, termcolor};
 use ecow::eco_format;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
 use same_file::is_same_file;
-use typst::diag::StrResult;
+use typst::diag::{bail, StrResult};
+use typst::utils::format_duration;
 
-use crate::args::{CompileCommand, Input};
-use crate::compile::compile_once;
+use crate::args::{Input, Output, WatchCommand};
+use crate::compile::{compile_once, CompileConfig};
 use crate::timings::Timer;
 use crate::world::{SystemWorld, WorldCreationError};
 use crate::{print_error, terminal};
 
 /// Execute a watching compilation command.
-pub fn watch(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
-    // Enter the alternate screen and handle Ctrl-C ourselves.
-    terminal::out().init_exit_handler()?;
-    terminal::out()
-        .enter_alternate_screen()
-        .map_err(|err| eco_format!("failed to enter alternate screen ({err})"))?;
+pub fn watch(timer: &mut Timer, command: &WatchCommand) -> StrResult<()> {
+    let mut config = CompileConfig::watching(command)?;
+
+    let Output::Path(output) = &config.output else {
+        bail!("cannot write document to stdout in watch mode");
+    };
 
     // Create a file system watcher.
-    let mut watcher = Watcher::new(command.output())?;
+    let mut watcher = Watcher::new(output.clone())?;
 
     // Create the world that serves sources, files, and fonts.
     // Additionally, if any files do not exist, wait until they do.
     let mut world = loop {
-        match SystemWorld::new(&command.common) {
+        match SystemWorld::new(
+            &command.args.input,
+            &command.args.world,
+            &command.args.process,
+        ) {
             Ok(world) => break world,
             Err(
                 ref err @ (WorldCreationError::InputNotFound(ref path)
                 | WorldCreationError::RootNotFound(ref path)),
             ) => {
                 watcher.update([path.clone()])?;
-                Status::Error.print(&command).unwrap();
+                Status::Error.print(&config).unwrap();
                 print_error(&err.to_string()).unwrap();
                 watcher.wait()?;
             }
@@ -48,7 +53,7 @@ pub fn watch(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
     };
 
     // Perform initial compilation.
-    timer.record(&mut world, |world| compile_once(world, &mut command, true))??;
+    timer.record(&mut world, |world| compile_once(world, &mut config))??;
 
     // Watch all dependencies of the initial compilation.
     watcher.update(world.dependencies())?;
@@ -62,7 +67,7 @@ pub fn watch(mut timer: Timer, mut command: CompileCommand) -> StrResult<()> {
         world.reset();
 
         // Recompile.
-        timer.record(&mut world, |world| compile_once(world, &mut command, true))??;
+        timer.record(&mut world, |world| compile_once(world, &mut config))??;
 
         // Evict the cache.
         comemo::evict(10);
@@ -268,40 +273,49 @@ pub enum Status {
 
 impl Status {
     /// Clear the terminal and render the status message.
-    pub fn print(&self, command: &CompileCommand) -> io::Result<()> {
-        let output = command.output();
+    pub fn print(&self, config: &CompileConfig) -> io::Result<()> {
         let timestamp = chrono::offset::Local::now().format("%H:%M:%S");
         let color = self.color();
 
-        let mut term_out = terminal::out();
-        term_out.clear_screen()?;
+        let mut out = terminal::out();
+        out.clear_screen()?;
 
-        term_out.set_color(&color)?;
-        write!(term_out, "watching")?;
-        term_out.reset()?;
-        match &command.common.input {
-            Input::Stdin => writeln!(term_out, " <stdin>"),
-            Input::Path(path) => writeln!(term_out, " {}", path.display()),
+        out.set_color(&color)?;
+        write!(out, "watching")?;
+        out.reset()?;
+        match &config.input {
+            Input::Stdin => writeln!(out, " <stdin>"),
+            Input::Path(path) => writeln!(out, " {}", path.display()),
         }?;
 
-        term_out.set_color(&color)?;
-        write!(term_out, "writing to")?;
-        term_out.reset()?;
-        writeln!(term_out, " {}", output.display())?;
+        out.set_color(&color)?;
+        write!(out, "writing to")?;
+        out.reset()?;
+        writeln!(out, " {}", config.output)?;
 
-        writeln!(term_out)?;
-        writeln!(term_out, "[{timestamp}] {}", self.message())?;
-        writeln!(term_out)?;
+        #[cfg(feature = "http-server")]
+        if let Some(server) = &config.server {
+            out.set_color(&color)?;
+            write!(out, "serving at")?;
+            out.reset()?;
+            writeln!(out, " http://{}", server.addr())?;
+        }
 
-        term_out.flush()
+        writeln!(out)?;
+        writeln!(out, "[{timestamp}] {}", self.message())?;
+        writeln!(out)?;
+
+        out.flush()
     }
 
     fn message(&self) -> String {
-        match self {
+        match *self {
             Self::Compiling => "compiling ...".into(),
-            Self::Success(duration) => format!("compiled successfully in {duration:.2?}"),
+            Self::Success(duration) => {
+                format!("compiled successfully in {}", format_duration(duration))
+            }
             Self::PartialSuccess(duration) => {
-                format!("compiled with warnings in {duration:.2?}")
+                format!("compiled with warnings in {}", format_duration(duration))
             }
             Self::Error => "compiled with errors".into(),
         }

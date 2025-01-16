@@ -18,39 +18,71 @@ pub fn func(stream: TokenStream, item: &syn::ItemFn) -> Result<TokenStream> {
 
 /// Details about a function.
 struct Func {
+    /// The function's name as exposed to Typst.
     name: String,
+    /// The function's title case name.
     title: String,
+    /// Whether this function has an associated scope defined by the `#[scope]` macro.
     scope: bool,
+    /// Whether this function is a constructor.
     constructor: bool,
+    /// A list of alternate search terms for this element.
     keywords: Vec<String>,
+    /// The parent type of this function.
+    ///
+    /// Used for functions in a scope.
     parent: Option<syn::Type>,
+    /// Whether this function is contextual.
+    contextual: bool,
+    /// The documentation for this element as a string.
     docs: String,
+    /// The element's visibility.
     vis: syn::Visibility,
+    /// The name for this function given in Rust.
     ident: Ident,
+    /// Special parameters provided by the runtime.
     special: SpecialParams,
+    /// The list of parameters for this function.
     params: Vec<Param>,
+    /// The return type of this function.
     returns: syn::Type,
 }
 
 /// Special parameters provided by the runtime.
 #[derive(Default)]
 struct SpecialParams {
+    /// The receiver (`self`) parameter.
     self_: Option<Param>,
+    /// The parameter named `engine`, of type `&mut Engine`.
     engine: bool,
+    /// The parameter named `context`, of type `Tracked<Context>`.
+    context: bool,
+    /// The parameter named `args`, of type `&mut Args`.
     args: bool,
+    /// The parameter named `span`, of type `Span`.
     span: bool,
 }
 
 /// Details about a function parameter.
 struct Param {
+    /// The binding for this parameter.
     binding: Binding,
+    /// The name of the parameter as defined in Rust.
     ident: Ident,
+    /// The type of the parameter.
     ty: syn::Type,
+    /// The name of the parameter as defined in Typst.
     name: String,
+    /// The documentation for this parameter as a string.
     docs: String,
+    /// Whether this parameter is named.
     named: bool,
+    /// Whether this parameter is variadic; that is, has its values
+    /// taken from a variable number of arguments.
     variadic: bool,
+    /// Whether this parameter exists only in documentation.
     external: bool,
+    /// The default value for this parameter.
     default: Option<syn::Expr>,
 }
 
@@ -66,11 +98,21 @@ enum Binding {
 
 /// The `..` in `#[func(..)]`.
 pub struct Meta {
+    /// Whether this function has an associated scope defined by the `#[scope]` macro.
     pub scope: bool,
+    /// Whether this function is contextual.
+    pub contextual: bool,
+    /// The function's name as exposed to Typst.
     pub name: Option<String>,
+    /// The function's title case name.
     pub title: Option<String>,
+    /// Whether this function is a constructor.
     pub constructor: bool,
+    /// A list of alternate search terms for this element.
     pub keywords: Vec<String>,
+    /// The parent type of this function.
+    ///
+    /// Used for functions in a scope.
     pub parent: Option<syn::Type>,
 }
 
@@ -78,6 +120,7 @@ impl Parse for Meta {
     fn parse(input: ParseStream) -> Result<Self> {
         Ok(Self {
             scope: parse_flag::<kw::scope>(input)?,
+            contextual: parse_flag::<kw::contextual>(input)?,
             name: parse_string::<kw::name>(input)?,
             title: parse_string::<kw::title>(input)?,
             constructor: parse_flag::<kw::constructor>(input)?,
@@ -117,6 +160,7 @@ fn parse(stream: TokenStream, item: &syn::ItemFn) -> Result<Func> {
         constructor: meta.constructor,
         keywords: meta.keywords,
         parent: meta.parent,
+        contextual: meta.contextual,
         docs,
         vis: item.vis.clone(),
         ident: item.sig.ident.clone(),
@@ -171,6 +215,7 @@ fn parse_param(
 
     match ident.to_string().as_str() {
         "engine" => special.engine = true,
+        "context" => special.context = true,
         "args" => special.args = true,
         "span" => special.span = true,
         _ => {
@@ -217,6 +262,7 @@ fn create(func: &Func, item: &syn::ItemFn) -> TokenStream {
         let ident_data = quote::format_ident!("{ident}_data");
         quote! {
             #[doc(hidden)]
+            #[allow(non_snake_case)]
             #vis fn #ident_data() -> &'static #foundations::NativeFuncData {
                 static DATA: #foundations::NativeFuncData = #data;
                 &DATA
@@ -227,6 +273,7 @@ fn create(func: &Func, item: &syn::ItemFn) -> TokenStream {
     quote! {
         #[doc = #docs]
         #[allow(dead_code)]
+        #[allow(rustdoc::broken_intra_doc_links)]
         #item
 
         #[doc(hidden)]
@@ -247,6 +294,7 @@ fn create_func_data(func: &Func) -> TokenStream {
         scope,
         parent,
         constructor,
+        contextual,
         ..
     } = func;
 
@@ -272,9 +320,10 @@ fn create_func_data(func: &Func) -> TokenStream {
             title: #title,
             docs: #docs,
             keywords: &[#(#keywords),*],
-            scope: #foundations::Lazy::new(|| #scope),
-            params: #foundations::Lazy::new(|| ::std::vec![#(#params),*]),
-            returns:  #foundations::Lazy::new(|| <#returns as #foundations::Reflect>::output()),
+            contextual: #contextual,
+            scope: ::std::sync::LazyLock::new(|| #scope),
+            params: ::std::sync::LazyLock::new(|| ::std::vec![#(#params),*]),
+            returns:  ::std::sync::LazyLock::new(|| <#returns as #foundations::Reflect>::output()),
         }
     }
 }
@@ -320,12 +369,13 @@ fn create_wrapper_closure(func: &Func) -> TokenStream {
             .as_ref()
             .map(bind)
             .map(|tokens| quote! { #tokens, });
-        let vt_ = func.special.engine.then(|| quote! { engine, });
+        let engine_ = func.special.engine.then(|| quote! { engine, });
+        let context_ = func.special.context.then(|| quote! { context, });
         let args_ = func.special.args.then(|| quote! { args, });
         let span_ = func.special.span.then(|| quote! { args.span, });
         let forwarded = func.params.iter().filter(|param| !param.external).map(bind);
         quote! {
-            __typst_func(#self_ #vt_ #args_ #span_ #(#forwarded,)*)
+            __typst_func(#self_ #engine_ #context_ #args_ #span_ #(#forwarded,)*)
         }
     };
 
@@ -333,7 +383,7 @@ fn create_wrapper_closure(func: &Func) -> TokenStream {
     let ident = &func.ident;
     let parent = func.parent.as_ref().map(|ty| quote! { #ty:: });
     quote! {
-        |engine, args| {
+        |engine, context, args| {
             let __typst_func = #parent #ident;
             #handlers
             #finish

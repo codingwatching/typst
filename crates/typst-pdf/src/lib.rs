@@ -1,337 +1,582 @@
-//! Exporting into PDF documents.
+//! Exporting of Typst documents into PDFs.
 
+mod catalog;
 mod color;
+mod color_font;
+mod content;
+mod embed;
 mod extg;
 mod font;
 mod gradient;
 mod image;
+mod named_destination;
 mod outline;
 mod page;
-mod pattern;
+mod resources;
+mod tiling;
 
-use std::cmp::Eq;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::ops::{Deref, DerefMut};
 
 use base64::Engine;
-use ecow::{eco_format, EcoString};
-use pdf_writer::types::Direction;
-use pdf_writer::writers::Destination;
-use pdf_writer::{Finish, Name, Pdf, Ref, Str, TextStr};
-use typst::foundations::{Datetime, Label, NativeElement};
-use typst::introspection::Location;
-use typst::layout::{Abs, Dir, Em, Transform};
-use typst::model::{Document, HeadingElem};
-use typst::text::{Font, Lang};
-use typst::util::Deferred;
-use typst::visualize::Image;
-use xmp_writer::{DateTime, LangId, RenditionClass, Timezone, XmpWriter};
+use ecow::EcoString;
+use pdf_writer::{Chunk, Name, Pdf, Ref, Str, TextStr};
+use serde::{Deserialize, Serialize};
+use typst_library::diag::{bail, SourceResult, StrResult};
+use typst_library::foundations::{Datetime, Smart};
+use typst_library::layout::{Abs, Em, PageRanges, PagedDocument, Transform};
+use typst_library::text::Font;
+use typst_library::visualize::Image;
+use typst_syntax::Span;
+use typst_utils::Deferred;
 
-use crate::color::ColorSpaces;
-use crate::extg::ExtGState;
-use crate::gradient::PdfGradient;
-use crate::image::EncodedImage;
-use crate::page::EncodedPage;
-use crate::pattern::PdfPattern;
+use crate::catalog::write_catalog;
+use crate::color::{alloc_color_functions_refs, ColorFunctionRefs};
+use crate::color_font::{write_color_fonts, ColorFontSlice};
+use crate::embed::write_embedded_files;
+use crate::extg::{write_graphic_states, ExtGState};
+use crate::font::write_fonts;
+use crate::gradient::{write_gradients, PdfGradient};
+use crate::image::write_images;
+use crate::named_destination::{write_named_destinations, NamedDestinations};
+use crate::page::{alloc_page_refs, traverse_pages, write_page_tree, EncodedPage};
+use crate::resources::{
+    alloc_resources_refs, write_resource_dictionaries, Resources, ResourcesRefs,
+};
+use crate::tiling::{write_tilings, PdfTiling};
 
 /// Export a document into a PDF file.
 ///
 /// Returns the raw bytes making up the PDF file.
-///
-/// The `ident` parameter shall be a string that uniquely and stably identifies
-/// the document. It should not change between compilations of the same
-/// document. Its hash will be used to create a PDF document identifier (the
-/// identifier itself is not leaked). If `ident` is `None`, a hash of the
-/// document is used instead (which means that it _will_ change across
-/// compilations).
-///
-/// The `timestamp`, if given, is expected to be the creation date of the
-/// document as a UTC datetime. It will only be used if `set document(date: ..)`
-/// is `auto`.
 #[typst_macros::time(name = "pdf")]
-pub fn pdf(
-    document: &Document,
-    ident: Option<&str>,
-    timestamp: Option<Datetime>,
-) -> Vec<u8> {
-    let mut ctx = PdfContext::new(document);
-    page::construct_pages(&mut ctx, &document.pages);
-    font::write_fonts(&mut ctx);
-    image::write_images(&mut ctx);
-    gradient::write_gradients(&mut ctx);
-    extg::write_external_graphics_states(&mut ctx);
-    pattern::write_patterns(&mut ctx);
-    write_named_destinations(&mut ctx);
-    page::write_page_tree(&mut ctx);
-    write_catalog(&mut ctx, ident, timestamp);
-    ctx.pdf.finish()
+pub fn pdf(document: &PagedDocument, options: &PdfOptions) -> SourceResult<Vec<u8>> {
+    PdfBuilder::new(document, options)
+        .phase(|builder| builder.run(traverse_pages))?
+        .phase(|builder| {
+            Ok(GlobalRefs {
+                color_functions: builder.run(alloc_color_functions_refs)?,
+                pages: builder.run(alloc_page_refs)?,
+                resources: builder.run(alloc_resources_refs)?,
+            })
+        })?
+        .phase(|builder| {
+            Ok(References {
+                named_destinations: builder.run(write_named_destinations)?,
+                fonts: builder.run(write_fonts)?,
+                color_fonts: builder.run(write_color_fonts)?,
+                images: builder.run(write_images)?,
+                gradients: builder.run(write_gradients)?,
+                tilings: builder.run(write_tilings)?,
+                ext_gs: builder.run(write_graphic_states)?,
+                embedded_files: builder.run(write_embedded_files)?,
+            })
+        })?
+        .phase(|builder| builder.run(write_page_tree))?
+        .phase(|builder| builder.run(write_resource_dictionaries))?
+        .export_with(write_catalog)
 }
 
-/// Context for exporting a whole PDF document.
-struct PdfContext<'a> {
-    /// The document that we're currently exporting.
-    document: &'a Document,
-    /// The writer we are writing the PDF into.
-    pdf: Pdf,
-    /// Content of exported pages.
-    pages: Vec<EncodedPage>,
-    /// For each font a mapping from used glyphs to their text representation.
-    /// May contain multiple chars in case of ligatures or similar things. The
-    /// same glyph can have a different text representation within one document,
-    /// then we just save the first one. The resulting strings are used for the
-    /// PDF's /ToUnicode map for glyphs that don't have an entry in the font's
-    /// cmap. This is important for copy-paste and searching.
-    glyph_sets: HashMap<Font, BTreeMap<u16, EcoString>>,
-    /// The number of glyphs for all referenced languages in the document.
-    /// We keep track of this to determine the main document language.
-    /// BTreeMap is used to write sorted list of languages to metadata.
-    languages: BTreeMap<Lang, usize>,
+/// Settings for PDF export.
+#[derive(Debug, Default)]
+pub struct PdfOptions<'a> {
+    /// If not `Smart::Auto`, shall be a string that uniquely and stably
+    /// identifies the document. It should not change between compilations of
+    /// the same document.  **If you cannot provide such a stable identifier,
+    /// just pass `Smart::Auto` rather than trying to come up with one.** The
+    /// CLI, for example, does not have a well-defined notion of a long-lived
+    /// project and as such just passes `Smart::Auto`.
+    ///
+    /// If an `ident` is given, the hash of it will be used to create a PDF
+    /// document identifier (the identifier itself is not leaked). If `ident` is
+    /// `Auto`, a hash of the document's title and author is used instead (which
+    /// is reasonably unique and stable).
+    pub ident: Smart<&'a str>,
+    /// If not `None`, shall be the creation timestamp of the document. It will
+    /// only be used if `set document(date: ..)` is `auto`.
+    pub timestamp: Option<Timestamp>,
+    /// Specifies which ranges of pages should be exported in the PDF. When
+    /// `None`, all pages should be exported.
+    pub page_ranges: Option<PageRanges>,
+    /// A list of PDF standards that Typst will enforce conformance with.
+    pub standards: PdfStandards,
+}
 
-    /// Allocator for indirect reference IDs.
+/// A timestamp with timezone information.
+#[derive(Debug, Clone, Copy)]
+pub struct Timestamp {
+    /// The datetime of the timestamp.
+    pub(crate) datetime: Datetime,
+    /// The timezone of the timestamp.
+    pub(crate) timezone: Timezone,
+}
+
+impl Timestamp {
+    /// Create a new timestamp with a given datetime and UTC suffix.
+    pub fn new_utc(datetime: Datetime) -> Self {
+        Self { datetime, timezone: Timezone::UTC }
+    }
+
+    /// Create a new timestamp with a given datetime, and a local timezone offset.
+    pub fn new_local(datetime: Datetime, whole_minute_offset: i32) -> Option<Self> {
+        let hour_offset = (whole_minute_offset / 60).try_into().ok()?;
+        // Note: the `%` operator in Rust is the remainder operator, not the
+        // modulo operator. The remainder operator can return negative results.
+        // We can simply apply `abs` here because we assume the `minute_offset`
+        // will have the same sign as `hour_offset`.
+        let minute_offset = (whole_minute_offset % 60).abs().try_into().ok()?;
+        match (hour_offset, minute_offset) {
+            // Only accept valid timezone offsets with `-23 <= hours <= 23`,
+            // and `0 <= minutes <= 59`.
+            (-23..=23, 0..=59) => Some(Self {
+                datetime,
+                timezone: Timezone::Local { hour_offset, minute_offset },
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A timezone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timezone {
+    /// The UTC timezone.
+    UTC,
+    /// The local timezone offset from UTC. And the `minute_offset` will have
+    /// same sign as `hour_offset`.
+    Local { hour_offset: i8, minute_offset: u8 },
+}
+
+/// Encapsulates a list of compatible PDF standards.
+#[derive(Clone)]
+pub struct PdfStandards {
+    /// For now, we simplify to just PDF/A. But it can be more fine-grained in
+    /// the future.
+    pub(crate) pdfa: bool,
+    /// Whether the standard allows for embedding any kind of file into the PDF.
+    /// We disallow this for PDF/A-2, since it only allows embedding
+    /// PDF/A-1 and PDF/A-2 documents.
+    pub(crate) embedded_files: bool,
+    /// Part of the PDF/A standard.
+    pub(crate) pdfa_part: Option<(i32, &'static str)>,
+}
+
+impl PdfStandards {
+    /// Validates a list of PDF standards for compatibility and returns their
+    /// encapsulated representation.
+    pub fn new(list: &[PdfStandard]) -> StrResult<Self> {
+        let a2b = list.contains(&PdfStandard::A_2b);
+        let a3b = list.contains(&PdfStandard::A_3b);
+
+        if a2b && a3b {
+            bail!("PDF cannot conform to A-2B and A-3B at the same time")
+        }
+
+        let pdfa = a2b || a3b;
+        Ok(Self {
+            pdfa,
+            embedded_files: !a2b,
+            pdfa_part: pdfa.then_some((if a2b { 2 } else { 3 }, "B")),
+        })
+    }
+}
+
+impl Debug for PdfStandards {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.pad("PdfStandards(..)")
+    }
+}
+
+impl Default for PdfStandards {
+    fn default() -> Self {
+        Self { pdfa: false, embedded_files: true, pdfa_part: None }
+    }
+}
+
+/// A PDF standard that Typst can enforce conformance with.
+///
+/// Support for more standards is planned.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[allow(non_camel_case_types)]
+#[non_exhaustive]
+pub enum PdfStandard {
+    /// PDF 1.7.
+    #[serde(rename = "1.7")]
+    V_1_7,
+    /// PDF/A-2b.
+    #[serde(rename = "a-2b")]
+    A_2b,
+    /// PDF/A-3b.
+    #[serde(rename = "a-3b")]
+    A_3b,
+}
+
+/// A struct to build a PDF following a fixed succession of phases.
+///
+/// This type uses generics to represent its current state. `S` (for "state") is
+/// all data that was produced by the previous phases, that is now read-only.
+///
+/// Phase after phase, this state will be transformed. Each phase corresponds to
+/// a call to the [eponymous function](`PdfBuilder::phase`) and produces a new
+/// part of the state, that will be aggregated with all other information, for
+/// consumption during the next phase.
+///
+/// In other words: this struct follows the **typestate pattern**. This prevents
+/// you from using data that is not yet available, at the type level.
+///
+/// Each phase consists of processes, that can read the state of the previous
+/// phases, and construct a part of the new state.
+///
+/// A final step, that has direct access to the global reference allocator and
+/// PDF document, can be run with [`PdfBuilder::export_with`].
+struct PdfBuilder<S> {
+    /// The context that has been accumulated so far.
+    state: S,
+    /// A global bump allocator.
     alloc: Ref,
-    /// The ID of the page tree.
-    page_tree_ref: Ref,
-    /// The IDs of written pages.
-    page_refs: Vec<Ref>,
-    /// The IDs of written fonts.
-    font_refs: Vec<Ref>,
-    /// The IDs of written images.
-    image_refs: Vec<Ref>,
-    /// The IDs of written gradients.
-    gradient_refs: Vec<Ref>,
-    /// The IDs of written patterns.
-    pattern_refs: Vec<Ref>,
-    /// The IDs of written external graphics states.
-    ext_gs_refs: Vec<Ref>,
-    /// Handles color space writing.
-    colors: ColorSpaces,
-
-    /// Deduplicates fonts used across the document.
-    font_map: Remapper<Font>,
-    /// Deduplicates images used across the document.
-    image_map: Remapper<Image>,
-    /// Handles to deferred image conversions.
-    image_deferred_map: HashMap<usize, Deferred<EncodedImage>>,
-    /// Deduplicates gradients used across the document.
-    gradient_map: Remapper<PdfGradient>,
-    /// Deduplicates patterns used across the document.
-    pattern_map: Remapper<PdfPattern>,
-    /// Deduplicates external graphics states used across the document.
-    extg_map: Remapper<ExtGState>,
-
-    /// A sorted list of all named destinations.
-    dests: Vec<(Label, Ref)>,
-    /// Maps from locations to named destinations that point to them.
-    loc_to_dest: HashMap<Location, Label>,
+    /// The PDF document that is being written.
+    pdf: Pdf,
 }
 
-impl<'a> PdfContext<'a> {
-    fn new(document: &'a Document) -> Self {
-        let mut alloc = Ref::new(1);
-        let page_tree_ref = alloc.bump();
+/// The initial state: we are exploring the document, collecting all resources
+/// that will be necessary later. The content of the pages is also built during
+/// this phase.
+struct WithDocument<'a> {
+    /// The Typst document that is exported.
+    document: &'a PagedDocument,
+    /// Settings for PDF export.
+    options: &'a PdfOptions<'a>,
+}
+
+/// At this point, resources were listed, but they don't have any reference
+/// associated with them.
+///
+/// This phase allocates some global references.
+struct WithResources<'a> {
+    document: &'a PagedDocument,
+    options: &'a PdfOptions<'a>,
+    /// The content of the pages encoded as PDF content streams.
+    ///
+    /// The pages are at the index corresponding to their page number, but they
+    /// may be `None` if they are not in the range specified by
+    /// `exported_pages`.
+    pages: Vec<Option<EncodedPage>>,
+    /// The PDF resources that are used in the content of the pages.
+    resources: Resources<()>,
+}
+
+/// Global references.
+struct GlobalRefs {
+    /// References for color conversion functions.
+    color_functions: ColorFunctionRefs,
+    /// Reference for pages.
+    ///
+    /// Items of this vector are `None` if the corresponding page is not
+    /// exported.
+    pages: Vec<Option<Ref>>,
+    /// References for the resource dictionaries.
+    resources: ResourcesRefs,
+}
+
+impl<'a> From<(WithDocument<'a>, (Vec<Option<EncodedPage>>, Resources<()>))>
+    for WithResources<'a>
+{
+    fn from(
+        (previous, (pages, resources)): (
+            WithDocument<'a>,
+            (Vec<Option<EncodedPage>>, Resources<()>),
+        ),
+    ) -> Self {
         Self {
-            document,
-            pdf: Pdf::new(),
-            pages: vec![],
-            glyph_sets: HashMap::new(),
-            languages: BTreeMap::new(),
-            alloc,
+            document: previous.document,
+            options: previous.options,
+            pages,
+            resources,
+        }
+    }
+}
+
+/// At this point, the resources have been collected, and global references have
+/// been allocated.
+///
+/// We are now writing objects corresponding to resources, and giving them references,
+/// that will be collected in [`References`].
+struct WithGlobalRefs<'a> {
+    document: &'a PagedDocument,
+    options: &'a PdfOptions<'a>,
+    pages: Vec<Option<EncodedPage>>,
+    /// Resources are the same as in previous phases, but each dictionary now has a reference.
+    resources: Resources,
+    /// Global references that were just allocated.
+    globals: GlobalRefs,
+}
+
+impl<'a> From<(WithResources<'a>, GlobalRefs)> for WithGlobalRefs<'a> {
+    fn from((previous, globals): (WithResources<'a>, GlobalRefs)) -> Self {
+        Self {
+            document: previous.document,
+            options: previous.options,
+            pages: previous.pages,
+            resources: previous.resources.with_refs(&globals.resources),
+            globals,
+        }
+    }
+}
+
+/// The references that have been assigned to each object.
+struct References {
+    /// List of named destinations, each with an ID.
+    named_destinations: NamedDestinations,
+    /// The IDs of written fonts.
+    fonts: HashMap<Font, Ref>,
+    /// The IDs of written color fonts.
+    color_fonts: HashMap<ColorFontSlice, Ref>,
+    /// The IDs of written images.
+    images: HashMap<Image, Ref>,
+    /// The IDs of written gradients.
+    gradients: HashMap<PdfGradient, Ref>,
+    /// The IDs of written tilings.
+    tilings: HashMap<PdfTiling, Ref>,
+    /// The IDs of written external graphics states.
+    ext_gs: HashMap<ExtGState, Ref>,
+    /// The names and references for embedded files.
+    embedded_files: BTreeMap<EcoString, Ref>,
+}
+
+/// At this point, the references have been assigned to all resources. The page
+/// tree is going to be written, and given a reference. It is also at this point that
+/// the page contents is actually written.
+struct WithRefs<'a> {
+    document: &'a PagedDocument,
+    options: &'a PdfOptions<'a>,
+    globals: GlobalRefs,
+    pages: Vec<Option<EncodedPage>>,
+    resources: Resources,
+    /// References that were allocated for resources.
+    references: References,
+}
+
+impl<'a> From<(WithGlobalRefs<'a>, References)> for WithRefs<'a> {
+    fn from((previous, references): (WithGlobalRefs<'a>, References)) -> Self {
+        Self {
+            document: previous.document,
+            options: previous.options,
+            globals: previous.globals,
+            pages: previous.pages,
+            resources: previous.resources,
+            references,
+        }
+    }
+}
+
+/// In this phase, we write resource dictionaries.
+///
+/// Each sub-resource gets its own isolated resource dictionary.
+struct WithEverything<'a> {
+    document: &'a PagedDocument,
+    options: &'a PdfOptions<'a>,
+    globals: GlobalRefs,
+    pages: Vec<Option<EncodedPage>>,
+    resources: Resources,
+    references: References,
+    /// Reference that was allocated for the page tree.
+    page_tree_ref: Ref,
+}
+
+impl<'a> From<(WithEverything<'a>, ())> for WithEverything<'a> {
+    fn from((this, _): (WithEverything<'a>, ())) -> Self {
+        this
+    }
+}
+
+impl<'a> From<(WithRefs<'a>, Ref)> for WithEverything<'a> {
+    fn from((previous, page_tree_ref): (WithRefs<'a>, Ref)) -> Self {
+        Self {
+            document: previous.document,
+            options: previous.options,
+            globals: previous.globals,
+            resources: previous.resources,
+            references: previous.references,
+            pages: previous.pages,
             page_tree_ref,
-            page_refs: vec![],
-            font_refs: vec![],
-            image_refs: vec![],
-            gradient_refs: vec![],
-            pattern_refs: vec![],
-            ext_gs_refs: vec![],
-            colors: ColorSpaces::default(),
-            font_map: Remapper::new(),
-            image_map: Remapper::new(),
-            image_deferred_map: HashMap::default(),
-            gradient_map: Remapper::new(),
-            pattern_map: Remapper::new(),
-            extg_map: Remapper::new(),
-            dests: vec![],
-            loc_to_dest: HashMap::new(),
         }
     }
 }
 
-/// Write the document catalog.
-fn write_catalog(ctx: &mut PdfContext, ident: Option<&str>, timestamp: Option<Datetime>) {
-    let lang = ctx.languages.iter().max_by_key(|(_, &count)| count).map(|(&l, _)| l);
-
-    let dir = if lang.map(Lang::dir) == Some(Dir::RTL) {
-        Direction::R2L
-    } else {
-        Direction::L2R
-    };
-
-    // Write the outline tree.
-    let outline_root_id = outline::write_outline(ctx);
-
-    // Write the page labels.
-    let page_labels = page::write_page_labels(ctx);
-
-    // Write the document information.
-    let mut info = ctx.pdf.document_info(ctx.alloc.bump());
-    let mut xmp = XmpWriter::new();
-    if let Some(title) = &ctx.document.title {
-        info.title(TextStr(title));
-        xmp.title([(None, title.as_str())]);
-    }
-
-    let authors = &ctx.document.author;
-    if !authors.is_empty() {
-        // Turns out that if the authors are given in both the document
-        // information dictionary and the XMP metadata, Acrobat takes a little
-        // bit of both: The first author from the document information
-        // dictionary and the remaining authors from the XMP metadata.
-        //
-        // To fix this for Acrobat, we could omit the remaining authors or all
-        // metadata from the document information catalog (it is optional) and
-        // only write XMP. However, not all other tools (including Apple
-        // Preview) read the XMP data. This means we do want to include all
-        // authors in the document information dictionary.
-        //
-        // Thus, the only alternative is to fold all authors into a single
-        // `<rdf:li>` in the XMP metadata. This is, in fact, exactly what the
-        // PDF/A spec Part 1 section 6.7.3 has to say about the matter. It's a
-        // bit weird to not use the array (and it makes Acrobat show the author
-        // list in quotes), but there's not much we can do about that.
-        let joined = authors.join(", ");
-        info.author(TextStr(&joined));
-        xmp.creator([joined.as_str()]);
-    }
-
-    let creator = eco_format!("Typst {}", env!("CARGO_PKG_VERSION"));
-    info.creator(TextStr(&creator));
-    xmp.creator_tool(&creator);
-
-    let keywords = &ctx.document.keywords;
-    if !keywords.is_empty() {
-        let joined = keywords.join(", ");
-        info.keywords(TextStr(&joined));
-        xmp.pdf_keywords(&joined);
-    }
-
-    if let Some(date) = ctx.document.date.unwrap_or(timestamp) {
-        let tz = ctx.document.date.is_auto();
-        if let Some(pdf_date) = pdf_date(date, tz) {
-            info.creation_date(pdf_date);
-            info.modified_date(pdf_date);
-        }
-        if let Some(xmp_date) = xmp_date(date, tz) {
-            xmp.create_date(xmp_date);
-            xmp.modify_date(xmp_date);
+impl<'a> PdfBuilder<WithDocument<'a>> {
+    /// Start building a PDF for a Typst document.
+    fn new(document: &'a PagedDocument, options: &'a PdfOptions<'a>) -> Self {
+        Self {
+            alloc: Ref::new(1),
+            pdf: Pdf::new(),
+            state: WithDocument { document, options },
         }
     }
-
-    info.finish();
-    xmp.num_pages(ctx.document.pages.len() as u32);
-    xmp.format("application/pdf");
-    xmp.language(ctx.languages.keys().map(|lang| LangId(lang.as_str())));
-
-    // A unique ID for this instance of the document. Changes if anything
-    // changes in the frames.
-    let instance_id = hash_base64(&ctx.pdf.as_bytes());
-
-    if let Some(ident) = ident {
-        // A unique ID for the document that stays stable across compilations.
-        let doc_id = hash_base64(&("PDF-1.7", ident));
-        xmp.document_id(&doc_id);
-        xmp.instance_id(&instance_id);
-        ctx.pdf
-            .set_file_id((doc_id.clone().into_bytes(), instance_id.into_bytes()));
-    } else {
-        // This is not spec-compliant, but some PDF readers really want an ID.
-        let bytes = instance_id.into_bytes();
-        ctx.pdf.set_file_id((bytes.clone(), bytes));
-    }
-
-    xmp.rendition_class(RenditionClass::Proof);
-    xmp.pdf_version("1.7");
-
-    let xmp_buf = xmp.finish(None);
-    let meta_ref = ctx.alloc.bump();
-    ctx.pdf
-        .stream(meta_ref, xmp_buf.as_bytes())
-        .pair(Name(b"Type"), Name(b"Metadata"))
-        .pair(Name(b"Subtype"), Name(b"XML"));
-
-    // Write the document catalog.
-    let mut catalog = ctx.pdf.catalog(ctx.alloc.bump());
-    catalog.pages(ctx.page_tree_ref);
-    catalog.viewer_preferences().direction(dir);
-    catalog.metadata(meta_ref);
-
-    // Write the named destination tree.
-    let mut name_dict = catalog.names();
-    let mut dests_name_tree = name_dict.destinations();
-    let mut names = dests_name_tree.names();
-    for &(name, dest_ref, ..) in &ctx.dests {
-        names.insert(Str(name.as_str().as_bytes()), dest_ref);
-    }
-    names.finish();
-    dests_name_tree.finish();
-    name_dict.finish();
-
-    // Insert the page labels.
-    if !page_labels.is_empty() {
-        let mut num_tree = catalog.page_labels();
-        let mut entries = num_tree.nums();
-        for (n, r) in &page_labels {
-            entries.insert(n.get() as i32 - 1, *r);
-        }
-    }
-
-    if let Some(outline_root_id) = outline_root_id {
-        catalog.outlines(outline_root_id);
-    }
-
-    if let Some(lang) = lang {
-        catalog.lang(TextStr(lang.as_str()));
-    }
-
-    catalog.finish();
 }
 
-/// Fills in the map and vector for named destinations and writes the indirect
-/// destination objects.
-fn write_named_destinations(ctx: &mut PdfContext) {
-    let mut seen = HashSet::new();
+impl<S> PdfBuilder<S> {
+    /// Start a new phase, and save its output in the global state.
+    fn phase<NS, B, O>(mut self, builder: B) -> SourceResult<PdfBuilder<NS>>
+    where
+        // New state
+        NS: From<(S, O)>,
+        // Builder
+        B: Fn(&mut Self) -> SourceResult<O>,
+    {
+        let output = builder(&mut self)?;
+        Ok(PdfBuilder {
+            state: NS::from((self.state, output)),
+            alloc: self.alloc,
+            pdf: self.pdf,
+        })
+    }
 
-    // Find all headings that have a label and are the first among other
-    // headings with the same label.
-    let mut matches: Vec<_> = ctx
-        .document
-        .introspector
-        .query(&HeadingElem::elem().select())
-        .iter()
-        .filter_map(|elem| elem.location().zip(elem.label()))
-        .filter(|&(_, label)| seen.insert(label))
-        .collect();
+    /// Run a step with the current state, merges its output into the PDF file,
+    /// and renumbers any references it returned.
+    fn run<P, O>(&mut self, process: P) -> SourceResult<O>
+    where
+        // Process
+        P: Fn(&S) -> SourceResult<(PdfChunk, O)>,
+        // Output
+        O: Renumber,
+    {
+        let (chunk, mut output) = process(&self.state)?;
+        // Allocate a final reference for each temporary one
+        let allocated = chunk.alloc.get() - TEMPORARY_REFS_START;
+        let offset = TEMPORARY_REFS_START - self.alloc.get();
 
-    // Named destinations must be sorted by key.
-    matches.sort_by_key(|&(_, label)| label);
+        // Merge the chunk into the PDF, using the new references
+        chunk.renumber_into(&mut self.pdf, |mut r| {
+            r.renumber(offset);
 
-    for (loc, label) in matches {
-        let pos = ctx.document.introspector.position(loc);
-        let index = pos.page.get() - 1;
-        let y = (pos.point.y - Abs::pt(10.0)).max(Abs::zero());
+            r
+        });
 
-        if let Some(page) = ctx.pages.get(index) {
-            let dest_ref = ctx.alloc.bump();
-            let x = pos.point.x.to_f32();
-            let y = (page.size.y - y).to_f32();
-            ctx.dests.push((label, dest_ref));
-            ctx.loc_to_dest.insert(loc, label);
-            ctx.pdf
-                .indirect(dest_ref)
-                .start::<Destination>()
-                .page(page.id)
-                .xyz(x, y, None);
+        // Also update the references in the output
+        output.renumber(offset);
+
+        self.alloc = Ref::new(self.alloc.get() + allocated);
+
+        Ok(output)
+    }
+
+    /// Finalize the PDF export and returns the buffer representing the
+    /// document.
+    fn export_with<P>(mut self, process: P) -> SourceResult<Vec<u8>>
+    where
+        P: Fn(S, &mut Pdf, &mut Ref) -> SourceResult<()>,
+    {
+        process(self.state, &mut self.pdf, &mut self.alloc)?;
+        Ok(self.pdf.finish())
+    }
+}
+
+/// A reference or collection of references that can be re-numbered,
+/// to become valid in a global scope.
+trait Renumber {
+    /// Renumber this value by shifting any references it contains by `offset`.
+    fn renumber(&mut self, offset: i32);
+}
+
+impl Renumber for () {
+    fn renumber(&mut self, _offset: i32) {}
+}
+
+impl Renumber for Ref {
+    fn renumber(&mut self, offset: i32) {
+        if self.get() >= TEMPORARY_REFS_START {
+            *self = Ref::new(self.get() - offset);
         }
+    }
+}
+
+impl<R: Renumber> Renumber for Vec<R> {
+    fn renumber(&mut self, offset: i32) {
+        for item in self {
+            item.renumber(offset);
+        }
+    }
+}
+
+impl<T: Eq + Hash, R: Renumber> Renumber for HashMap<T, R> {
+    fn renumber(&mut self, offset: i32) {
+        for v in self.values_mut() {
+            v.renumber(offset);
+        }
+    }
+}
+
+impl<T: Ord, R: Renumber> Renumber for BTreeMap<T, R> {
+    fn renumber(&mut self, offset: i32) {
+        for v in self.values_mut() {
+            v.renumber(offset);
+        }
+    }
+}
+
+impl<R: Renumber> Renumber for Option<R> {
+    fn renumber(&mut self, offset: i32) {
+        if let Some(r) = self {
+            r.renumber(offset)
+        }
+    }
+}
+
+impl<T, R: Renumber> Renumber for (T, R) {
+    fn renumber(&mut self, offset: i32) {
+        self.1.renumber(offset)
+    }
+}
+
+/// A portion of a PDF file.
+struct PdfChunk {
+    /// The actual chunk.
+    chunk: Chunk,
+    /// A local allocator.
+    alloc: Ref,
+}
+
+/// Any reference below that value was already allocated before and
+/// should not be rewritten. Anything above was allocated in the current
+/// chunk, and should be remapped.
+///
+/// This is a constant (large enough to avoid collisions) and not
+/// dependent on self.alloc to allow for better memoization of steps, if
+/// needed in the future.
+const TEMPORARY_REFS_START: i32 = 1_000_000_000;
+
+/// A part of a PDF document.
+impl PdfChunk {
+    /// Start writing a new part of the document.
+    fn new() -> Self {
+        PdfChunk {
+            chunk: Chunk::new(),
+            alloc: Ref::new(TEMPORARY_REFS_START),
+        }
+    }
+
+    /// Allocate a reference that is valid in the context of this chunk.
+    ///
+    /// References allocated with this function should be [renumbered](`Renumber::renumber`)
+    /// before being used in other chunks. This is done automatically if these
+    /// references are stored in the global `PdfBuilder` state.
+    fn alloc(&mut self) -> Ref {
+        self.alloc.bump()
+    }
+}
+
+impl Deref for PdfChunk {
+    type Target = Chunk;
+
+    fn deref(&self) -> &Self::Target {
+        &self.chunk
+    }
+}
+
+impl DerefMut for PdfChunk {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.chunk
     }
 }
 
@@ -339,12 +584,6 @@ fn write_named_destinations(ctx: &mut PdfContext) {
 fn deflate(data: &[u8]) -> Vec<u8> {
     const COMPRESSION_LEVEL: u8 = 6;
     miniz_oxide::deflate::compress_to_vec_zlib(data, COMPRESSION_LEVEL)
-}
-
-/// Memoized version of [`deflate`] specialized for a page's content stream.
-#[comemo::memoize]
-fn deflate_memoized(content: &[u8]) -> Arc<Vec<u8>> {
-    Arc::new(deflate(content))
 }
 
 /// Memoized and deferred version of [`deflate`] specialized for a page's content
@@ -357,91 +596,7 @@ fn deflate_deferred(content: Vec<u8>) -> Deferred<Vec<u8>> {
 /// Create a base64-encoded hash of the value.
 fn hash_base64<T: Hash>(value: &T) -> String {
     base64::engine::general_purpose::STANDARD
-        .encode(typst::util::hash128(value).to_be_bytes())
-}
-
-/// Converts a datetime to a pdf-writer date.
-fn pdf_date(datetime: Datetime, tz: bool) -> Option<pdf_writer::Date> {
-    let year = datetime.year().filter(|&y| y >= 0)? as u16;
-
-    let mut pdf_date = pdf_writer::Date::new(year);
-
-    if let Some(month) = datetime.month() {
-        pdf_date = pdf_date.month(month);
-    }
-
-    if let Some(day) = datetime.day() {
-        pdf_date = pdf_date.day(day);
-    }
-
-    if let Some(h) = datetime.hour() {
-        pdf_date = pdf_date.hour(h);
-    }
-
-    if let Some(m) = datetime.minute() {
-        pdf_date = pdf_date.minute(m);
-    }
-
-    if let Some(s) = datetime.second() {
-        pdf_date = pdf_date.second(s);
-    }
-
-    if tz {
-        pdf_date = pdf_date.utc_offset_hour(0).utc_offset_minute(0);
-    }
-
-    Some(pdf_date)
-}
-
-/// Converts a datetime to an xmp-writer datetime.
-fn xmp_date(datetime: Datetime, tz: bool) -> Option<xmp_writer::DateTime> {
-    let year = datetime.year().filter(|&y| y >= 0)? as u16;
-    Some(DateTime {
-        year,
-        month: datetime.month(),
-        day: datetime.day(),
-        hour: datetime.hour(),
-        minute: datetime.minute(),
-        second: datetime.second(),
-        timezone: if tz { Some(Timezone::Utc) } else { None },
-    })
-}
-
-/// Assigns new, consecutive PDF-internal indices to items.
-struct Remapper<T> {
-    /// Forwards from the items to the pdf indices.
-    to_pdf: HashMap<T, usize>,
-    /// Backwards from the pdf indices to the items.
-    to_items: Vec<T>,
-}
-
-impl<T> Remapper<T>
-where
-    T: Eq + Hash + Clone,
-{
-    fn new() -> Self {
-        Self { to_pdf: HashMap::new(), to_items: vec![] }
-    }
-
-    fn insert(&mut self, item: T) -> usize {
-        let to_layout = &mut self.to_items;
-        *self.to_pdf.entry(item.clone()).or_insert_with(|| {
-            let pdf_index = to_layout.len();
-            to_layout.push(item);
-            pdf_index
-        })
-    }
-
-    fn pdf_indices<'a>(
-        &'a self,
-        refs: &'a [Ref],
-    ) -> impl Iterator<Item = (Ref, usize)> + 'a {
-        refs.iter().copied().zip(0..self.to_pdf.len())
-    }
-
-    fn items(&self) -> impl Iterator<Item = &T> + '_ {
-        self.to_items.iter()
-    }
+        .encode(typst_utils::hash128(value).to_be_bytes())
 }
 
 /// Additional methods for [`Abs`].
@@ -468,6 +623,63 @@ impl EmExt for Em {
     }
 }
 
+trait NameExt<'a> {
+    /// The maximum length of a name in PDF/A.
+    const PDFA_LIMIT: usize = 127;
+}
+
+impl<'a> NameExt<'a> for Name<'a> {}
+
+/// Additional methods for [`Str`].
+trait StrExt<'a>: Sized {
+    /// The maximum length of a string in PDF/A.
+    const PDFA_LIMIT: usize = 32767;
+
+    /// Create a string that satisfies the constraints of PDF/A.
+    #[allow(unused)]
+    fn trimmed(string: &'a [u8]) -> Self;
+}
+
+impl<'a> StrExt<'a> for Str<'a> {
+    fn trimmed(string: &'a [u8]) -> Self {
+        Self(&string[..string.len().min(Self::PDFA_LIMIT)])
+    }
+}
+
+/// Additional methods for [`TextStr`].
+trait TextStrExt<'a>: Sized {
+    /// The maximum length of a string in PDF/A.
+    const PDFA_LIMIT: usize = Str::PDFA_LIMIT;
+
+    /// Create a text string that satisfies the constraints of PDF/A.
+    fn trimmed(string: &'a str) -> Self;
+}
+
+impl<'a> TextStrExt<'a> for TextStr<'a> {
+    fn trimmed(string: &'a str) -> Self {
+        Self(&string[..string.len().min(Self::PDFA_LIMIT)])
+    }
+}
+
+/// Extension trait for [`Content`](pdf_writer::Content).
+trait ContentExt {
+    fn save_state_checked(&mut self) -> SourceResult<()>;
+}
+
+impl ContentExt for pdf_writer::Content {
+    fn save_state_checked(&mut self) -> SourceResult<()> {
+        self.save_state();
+        if self.state_nesting_depth() > 28 {
+            bail!(
+                Span::detached(),
+                "maximum PDF grouping depth exceeding";
+                hint: "try to avoid excessive nesting of layout containers",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Convert to an array of floats.
 fn transform_to_array(ts: Transform) -> [f32; 6] {
     [
@@ -478,4 +690,42 @@ fn transform_to_array(ts: Transform) -> [f32; 6] {
         ts.tx.to_f32(),
         ts.ty.to_f32(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timestamp_new_local() {
+        let dummy_datetime = Datetime::from_ymd_hms(2024, 12, 17, 10, 10, 10).unwrap();
+        let test = |whole_minute_offset, expect_timezone| {
+            assert_eq!(
+                Timestamp::new_local(dummy_datetime, whole_minute_offset)
+                    .unwrap()
+                    .timezone,
+                expect_timezone
+            );
+        };
+
+        // Valid timezone offsets
+        test(0, Timezone::Local { hour_offset: 0, minute_offset: 0 });
+        test(480, Timezone::Local { hour_offset: 8, minute_offset: 0 });
+        test(-480, Timezone::Local { hour_offset: -8, minute_offset: 0 });
+        test(330, Timezone::Local { hour_offset: 5, minute_offset: 30 });
+        test(-210, Timezone::Local { hour_offset: -3, minute_offset: 30 });
+        test(-720, Timezone::Local { hour_offset: -12, minute_offset: 0 }); // AoE
+
+        // Corner cases
+        test(315, Timezone::Local { hour_offset: 5, minute_offset: 15 });
+        test(-225, Timezone::Local { hour_offset: -3, minute_offset: 45 });
+        test(1439, Timezone::Local { hour_offset: 23, minute_offset: 59 });
+        test(-1439, Timezone::Local { hour_offset: -23, minute_offset: 59 });
+
+        // Invalid timezone offsets
+        assert!(Timestamp::new_local(dummy_datetime, 1440).is_none());
+        assert!(Timestamp::new_local(dummy_datetime, -1440).is_none());
+        assert!(Timestamp::new_local(dummy_datetime, i32::MAX).is_none());
+        assert!(Timestamp::new_local(dummy_datetime, i32::MIN).is_none());
+    }
 }
