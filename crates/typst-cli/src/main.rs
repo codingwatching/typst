@@ -2,8 +2,12 @@ mod args;
 mod compile;
 mod download;
 mod fonts;
+mod greet;
+mod init;
 mod package;
 mod query;
+#[cfg(feature = "http-server")]
+mod server;
 mod terminal;
 mod timings;
 #[cfg(feature = "self-update")]
@@ -14,48 +18,62 @@ mod world;
 use std::cell::Cell;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
+use clap::error::ErrorKind;
 use clap::Parser;
 use codespan_reporting::term;
 use codespan_reporting::term::termcolor::WriteColor;
-use ecow::eco_format;
-use once_cell::sync::Lazy;
+use typst::diag::HintedStrResult;
 
 use crate::args::{CliArguments, Command};
 use crate::timings::Timer;
 
 thread_local! {
     /// The CLI's exit code.
-    static EXIT: Cell<ExitCode> = Cell::new(ExitCode::SUCCESS);
+    static EXIT: Cell<ExitCode> = const { Cell::new(ExitCode::SUCCESS) };
 }
 
-/// The parsed commandline arguments.
-static ARGS: Lazy<CliArguments> = Lazy::new(CliArguments::parse);
+/// The parsed command line arguments.
+static ARGS: LazyLock<CliArguments> = LazyLock::new(|| {
+    CliArguments::try_parse().unwrap_or_else(|error| {
+        if error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+            crate::greet::greet();
+        }
+        error.exit();
+    })
+});
 
 /// Entry point.
 fn main() -> ExitCode {
-    let timer = Timer::new(&ARGS);
+    // Handle SIGPIPE
+    // https://stackoverflow.com/questions/65755853/simple-word-count-rust-program-outputs-valid-stdout-but-panicks-when-piped-to-he/65760807
+    sigpipe::reset();
 
-    let res = match &ARGS.command {
-        Command::Compile(command) => crate::compile::compile(timer, command.clone()),
-        Command::Watch(command) => crate::watch::watch(timer, command.clone()),
-        Command::Query(command) => crate::query::query(command),
-        Command::Fonts(command) => crate::fonts::fonts(command),
-        Command::Update(command) => crate::update::update(command),
-    };
+    let res = dispatch();
 
-    // Leave the alternate screen if it was opened. This operation is done here
-    // so that it is executed prior to printing the final error.
-    let res_leave = terminal::out()
-        .leave_alternate_screen()
-        .map_err(|err| eco_format!("failed to leave alternate screen ({err})"));
-
-    if let Some(msg) = res.err().or(res_leave.err()) {
+    if let Err(msg) = res {
         set_failed();
-        print_error(&msg).expect("failed to print error");
+        print_error(msg.message()).expect("failed to print error");
     }
 
     EXIT.with(|cell| cell.get())
+}
+
+/// Execute the requested command.
+fn dispatch() -> HintedStrResult<()> {
+    let mut timer = Timer::new(&ARGS);
+
+    match &ARGS.command {
+        Command::Compile(command) => crate::compile::compile(&mut timer, command)?,
+        Command::Watch(command) => crate::watch::watch(&mut timer, command)?,
+        Command::Init(command) => crate::init::init(command)?,
+        Command::Query(command) => crate::query::query(command)?,
+        Command::Fonts(command) => crate::fonts::fonts(command),
+        Command::Update(command) => crate::update::update(command)?,
+    }
+
+    Ok(())
 }
 
 /// Ensure a failure exit code.
@@ -82,8 +100,9 @@ fn print_error(msg: &str) -> io::Result<()> {
 
 #[cfg(not(feature = "self-update"))]
 mod update {
-    use crate::args::UpdateCommand;
     use typst::diag::{bail, StrResult};
+
+    use crate::args::UpdateCommand;
 
     pub fn update(_: &UpdateCommand) -> StrResult<()> {
         bail!(

@@ -13,34 +13,64 @@ pub fn scope(_: TokenStream, item: syn::Item) -> Result<TokenStream> {
 
     let self_ty = &item.self_ty;
 
+    let mut primitive_ident_ext = None;
+    if let syn::Type::Path(syn::TypePath { path, .. }) = self_ty.as_ref() {
+        if let Some(ident) = path.get_ident() {
+            if is_primitive(ident) {
+                let ident_ext = quote::format_ident!("{ident}Ext");
+                primitive_ident_ext = Some(ident_ext);
+            }
+        }
+    }
+
+    let self_ty_expr = match &primitive_ident_ext {
+        None => quote! { #self_ty },
+        Some(ident_ext) => quote! { <#self_ty as #ident_ext> },
+    };
+
     let mut definitions = vec![];
     let mut constructor = quote! { None };
     for child in &mut item.items {
-        let def = match child {
-            syn::ImplItem::Const(item) => handle_const(self_ty, item)?,
-            syn::ImplItem::Fn(item) => match handle_fn(self_ty, item)? {
-                FnKind::Member(tokens) => tokens,
-                FnKind::Constructor(tokens) => {
-                    constructor = tokens;
-                    continue;
-                }
-            },
-            syn::ImplItem::Verbatim(item) => handle_type_or_elem(item)?,
+        let bare: BareType;
+        let (mut def, attrs) = match child {
+            syn::ImplItem::Const(item) => {
+                (handle_const(&self_ty_expr, item)?, &item.attrs)
+            }
+            syn::ImplItem::Fn(item) => (
+                match handle_fn(self_ty, item)? {
+                    FnKind::Member(tokens) => tokens,
+                    FnKind::Constructor(tokens) => {
+                        constructor = tokens;
+                        continue;
+                    }
+                },
+                &item.attrs,
+            ),
+            syn::ImplItem::Verbatim(item) => {
+                bare = syn::parse2(item.clone())?;
+                (handle_type_or_elem(&bare)?, &bare.attrs)
+            }
             _ => bail!(child, "unexpected item in scope"),
         };
+
+        if let Some(message) = attrs.iter().find_map(|attr| match &attr.meta {
+            syn::Meta::NameValue(pair) if pair.path.is_ident("deprecated") => {
+                Some(&pair.value)
+            }
+            _ => None,
+        }) {
+            def = quote! { #def.deprecated(#message) }
+        }
+
         definitions.push(def);
     }
 
     item.items.retain(|item| !matches!(item, syn::ImplItem::Verbatim(_)));
 
-    let mut base = quote! { #item };
-    if let syn::Type::Path(syn::TypePath { path, .. }) = self_ty.as_ref() {
-        if let Some(ident) = path.get_ident() {
-            if is_primitive(ident) {
-                base = rewrite_primitive_base(&item, ident);
-            }
-        }
-    }
+    let base = match &primitive_ident_ext {
+        None => quote! { #item },
+        Some(ident_ext) => rewrite_primitive_base(&item, ident_ext),
+    };
 
     Ok(quote! {
         #base
@@ -50,6 +80,7 @@ pub fn scope(_: TokenStream, item: syn::Item) -> Result<TokenStream> {
                 #constructor
             }
 
+            #[allow(deprecated)]
             fn scope() -> #foundations::Scope {
                 let mut scope = #foundations::Scope::deduplicating();
                 #(#definitions;)*
@@ -60,15 +91,14 @@ pub fn scope(_: TokenStream, item: syn::Item) -> Result<TokenStream> {
 }
 
 /// Process a const item and returns its definition.
-fn handle_const(self_ty: &syn::Type, item: &syn::ImplItemConst) -> Result<TokenStream> {
+fn handle_const(self_ty: &TokenStream, item: &syn::ImplItemConst) -> Result<TokenStream> {
     let ident = &item.ident;
     let name = ident.to_string().to_kebab_case();
     Ok(quote! { scope.define(#name, #self_ty::#ident) })
 }
 
 /// Process a type item.
-fn handle_type_or_elem(item: &TokenStream) -> Result<TokenStream> {
-    let item: BareType = syn::parse2(item.clone())?;
+fn handle_type_or_elem(item: &BareType) -> Result<TokenStream> {
     let ident = &item.ident;
     let define = if item.attrs.iter().any(|attr| attr.path().is_ident("elem")) {
         quote! { define_elem }
@@ -117,33 +147,42 @@ fn is_primitive(ident: &syn::Ident) -> bool {
 }
 
 /// Rewrite an impl block for a primitive into a trait + trait impl.
-fn rewrite_primitive_base(item: &syn::ItemImpl, ident: &syn::Ident) -> TokenStream {
+fn rewrite_primitive_base(item: &syn::ItemImpl, ident_ext: &syn::Ident) -> TokenStream {
     let mut sigs = vec![];
     let mut items = vec![];
     for sub in &item.items {
-        let syn::ImplItem::Fn(mut func) = sub.clone() else { continue };
-        func.vis = syn::Visibility::Inherited;
-        items.push(func.clone());
+        match sub.clone() {
+            syn::ImplItem::Fn(mut func) => {
+                func.vis = syn::Visibility::Inherited;
+                items.push(func.clone());
 
-        let mut sig = func.sig;
-        let inputs = sig.inputs.iter().cloned().map(|mut input| {
-            if let syn::FnArg::Typed(typed) = &mut input {
-                typed.attrs.clear();
+                let mut sig = func.sig;
+                let inputs = sig.inputs.iter().cloned().map(|mut input| {
+                    if let syn::FnArg::Typed(typed) = &mut input {
+                        typed.attrs.clear();
+                    }
+                    input
+                });
+                sig.inputs = parse_quote! { #(#inputs),* };
+
+                let ident_data = quote::format_ident!("{}_data", sig.ident);
+                sigs.push(quote! { #sig; });
+                sigs.push(quote! {
+                    fn #ident_data() -> &'static #foundations::NativeFuncData;
+                });
             }
-            input
-        });
-        sig.inputs = parse_quote! { #(#inputs),* };
 
-        let ident_data = quote::format_ident!("{}_data", sig.ident);
-        sigs.push(quote! { #sig; });
-        sigs.push(quote! {
-            fn #ident_data() -> &'static #foundations::NativeFuncData;
-        });
+            syn::ImplItem::Const(cons) => {
+                sigs.push(quote! { #cons });
+            }
+
+            _ => {}
+        }
     }
 
-    let ident_ext = quote::format_ident!("{ident}Ext");
     let self_ty = &item.self_ty;
     quote! {
+        #[allow(non_camel_case_types)]
         trait #ident_ext {
             #(#sigs)*
         }

@@ -5,19 +5,19 @@
 <p align="center">
   <a href="https://typst.app/docs/">
     <img alt="Documentation" src="https://img.shields.io/website?down_message=offline&label=docs&up_color=007aff&up_message=online&url=https%3A%2F%2Ftypst.app%2Fdocs"
-  /></a>
+  ></a>
   <a href="https://typst.app/">
     <img alt="Typst App" src="https://img.shields.io/website?down_message=offline&label=typst.app&up_color=239dad&up_message=online&url=https%3A%2F%2Ftypst.app"
-  /></a>
+  ></a>
   <a href="https://discord.gg/2uDybryKPe">
     <img alt="Discord Server" src="https://img.shields.io/discord/1054443721975922748?color=5865F2&label=discord&labelColor=555"
-  /></a>
+  ></a>
   <a href="https://github.com/typst/typst/blob/main/LICENSE">
     <img alt="Apache-2 License" src="https://img.shields.io/badge/license-Apache%202-brightgreen"
-  /></a>
+  ></a>
   <a href="https://typst.app/jobs/">
     <img alt="Jobs at Typst" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ftypst.app%2Fassets%2Fdata%2Fshields.json&query=%24.jobs.text&label=jobs&color=%23A561FF&cacheSeconds=1800"
-  /></a>
+  ></a>
 </p>
 
 Typst is a new markup-based typesetting system that is designed to be as powerful
@@ -32,15 +32,14 @@ as LaTeX while being much easier to learn and use. Typst has:
 
 This repository contains the Typst compiler and its CLI, which is everything you
 need to compile Typst documents locally. For the best writing experience,
-consider signing up to our [collaborative online editor][app] for free. It is
-currently in public beta.
+consider signing up to our [collaborative online editor][app] for free.
 
 ## Example
 A [gentle introduction][tutorial] to Typst is available in our documentation.
 However, if you want to see the power of Typst encapsulated in one image, here
 it is:
 <p align="center">
- <img alt="Example" width="900" src="https://user-images.githubusercontent.com/17899797/228031796-ced0e452-fcee-4ae9-92da-b9287764ff25.png"/>
+ <img alt="Example" width="900" src="https://user-images.githubusercontent.com/17899797/228031796-ced0e452-fcee-4ae9-92da-b9287764ff25.png">
 </p>
 
 
@@ -118,16 +117,19 @@ Typst's CLI is available from different sources:
   - macOS: `brew install typst`
   - Windows: `winget install --id Typst.Typst`
 
-- If you have a [Rust][rust] toolchain installed, you can also install the
-  latest development version with
-  `cargo install --git https://github.com/typst/typst --locked typst-cli`. Note that this
-  will be a "nightly" version that may be broken or not yet properly documented.
+- If you have a [Rust][rust] toolchain installed, you can install
+  - the latest released Typst version with
+    `cargo install --locked typst-cli`
+  - a development version with
+    `cargo install --git https://github.com/typst/typst --locked typst-cli`
 
-- Nix users can use the `typst` package with `nix-shell -p typst` or build and
-  run the bleeding edge version with `nix run github:typst/typst -- --version`.
+- Nix users can
+  - use the `typst` package with `nix-shell -p typst`
+  - build and run a development version with
+    `nix run github:typst/typst -- --version`.
 
 - Docker users can run a prebuilt image with
-  `docker run -it ghcr.io/typst/typst:latest`.
+  `docker run ghcr.io/typst/typst:latest --help`.
 
 ## Usage
 Once you have installed Typst, you can use it like this:
@@ -170,8 +172,7 @@ typst help watch
 ```
 
 If you prefer an integrated IDE-like experience with autocompletion and instant
-preview, you can also check out the [Typst web app][app], which is currently in
-public beta.
+preview, you can also check out [Typst's free web app][app].
 
 ## Community
 The main place where the community gathers is our [Discord server][discord].

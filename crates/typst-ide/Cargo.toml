@@ -10,20 +10,22 @@ repository = { workspace = true }
 license = { workspace = true }
 categories = { workspace = true }
 keywords = { workspace = true }
-
-[lib]
-test = false
-doctest = false
-bench = false
+readme = { workspace = true }
 
 [dependencies]
 typst = { workspace = true }
+typst-eval = { workspace = true }
 comemo = { workspace = true }
 ecow = { workspace = true }
 if_chain = { workspace = true }
-log = { workspace = true }
+pathdiff = { workspace = true }
 serde = { workspace = true }
 unscanny = { workspace = true }
+
+[dev-dependencies]
+typst-assets = { workspace = true, features = ["fonts"] }
+typst-dev-assets = { workspace = true }
+once_cell = { workspace = true }
 
 [lints]
 workspace = true

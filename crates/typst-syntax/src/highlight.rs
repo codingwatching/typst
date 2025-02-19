@@ -153,6 +153,9 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Strong => Some(Tag::Strong),
         SyntaxKind::Emph => Some(Tag::Emph),
         SyntaxKind::Raw => Some(Tag::Raw),
+        SyntaxKind::RawLang => None,
+        SyntaxKind::RawTrimmed => None,
+        SyntaxKind::RawDelim => None,
         SyntaxKind::Link => Some(Tag::Link),
         SyntaxKind::Label => Some(Tag::Label),
         SyntaxKind::Ref => Some(Tag::Ref),
@@ -168,7 +171,9 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Equation => None,
 
         SyntaxKind::Math => None,
+        SyntaxKind::MathText => None,
         SyntaxKind::MathIdent => highlight_ident(node),
+        SyntaxKind::MathShorthand => Some(Tag::Escape),
         SyntaxKind::MathAlignPoint => Some(Tag::MathOperator),
         SyntaxKind::MathDelimited => None,
         SyntaxKind::MathAttach => None,
@@ -230,6 +235,7 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Let => Some(Tag::Keyword),
         SyntaxKind::Set => Some(Tag::Keyword),
         SyntaxKind::Show => Some(Tag::Keyword),
+        SyntaxKind::Context => Some(Tag::Keyword),
         SyntaxKind::If => Some(Tag::Keyword),
         SyntaxKind::Else => Some(Tag::Keyword),
         SyntaxKind::For => Some(Tag::Keyword),
@@ -267,11 +273,13 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::LetBinding => None,
         SyntaxKind::SetRule => None,
         SyntaxKind::ShowRule => None,
+        SyntaxKind::Contextual => None,
         SyntaxKind::Conditional => None,
         SyntaxKind::WhileLoop => None,
         SyntaxKind::ForLoop => None,
         SyntaxKind::ModuleImport => None,
         SyntaxKind::ImportItems => None,
+        SyntaxKind::ImportItemPath => None,
         SyntaxKind::RenamedImportItem => None,
         SyntaxKind::ModuleInclude => None,
         SyntaxKind::LoopBreak => None,
@@ -280,10 +288,11 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Destructuring => None,
         SyntaxKind::DestructAssignment => None,
 
+        SyntaxKind::Shebang => Some(Tag::Comment),
         SyntaxKind::LineComment => Some(Tag::Comment),
         SyntaxKind::BlockComment => Some(Tag::Comment),
         SyntaxKind::Error => Some(Tag::Error),
-        SyntaxKind::Eof => None,
+        SyntaxKind::End => None,
     }
 }
 
@@ -404,8 +413,9 @@ fn highlight_html_impl(html: &mut String, node: &LinkedNode) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::ops::Range;
+
+    use super::*;
 
     #[test]
     fn test_highlighting() {

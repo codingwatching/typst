@@ -2,10 +2,11 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
+use std::iter::zip;
 use std::ops::Range;
 use std::sync::Arc;
 
-use comemo::Prehashed;
+use typst_utils::LazyHash;
 
 use crate::reparser::reparse;
 use crate::{is_newline, parse, FileId, LinkedNode, Span, SyntaxNode, VirtualPath};
@@ -23,21 +24,22 @@ pub struct Source(Arc<Repr>);
 #[derive(Clone)]
 struct Repr {
     id: FileId,
-    text: Prehashed<String>,
-    root: Prehashed<SyntaxNode>,
+    text: LazyHash<String>,
+    root: LazyHash<SyntaxNode>,
     lines: Vec<Line>,
 }
 
 impl Source {
     /// Create a new source file.
     pub fn new(id: FileId, text: String) -> Self {
+        let _scope = typst_timing::TimingScope::new("create source");
         let mut root = parse(&text);
         root.numberize(id, Span::FULL).unwrap();
         Self(Arc::new(Repr {
             id,
             lines: lines(&text),
-            text: Prehashed::new(text),
-            root: Prehashed::new(root),
+            text: LazyHash::new(text),
+            root: LazyHash::new(root),
         }))
     }
 
@@ -74,14 +76,11 @@ impl Source {
     ///
     /// Returns the range in the new source that was ultimately reparsed.
     pub fn replace(&mut self, new: &str) -> Range<usize> {
+        let _scope = typst_timing::TimingScope::new("replace source");
         let old = self.text();
 
-        let mut prefix = old
-            .as_bytes()
-            .iter()
-            .zip(new.as_bytes())
-            .take_while(|(x, y)| x == y)
-            .count();
+        let mut prefix =
+            zip(old.bytes(), new.bytes()).take_while(|(x, y)| x == y).count();
 
         if prefix == old.len() && prefix == new.len() {
             return 0..0;
@@ -91,11 +90,7 @@ impl Source {
             prefix -= 1;
         }
 
-        let mut suffix = old[prefix..]
-            .as_bytes()
-            .iter()
-            .zip(new[prefix..].as_bytes())
-            .rev()
+        let mut suffix = zip(old[prefix..].bytes().rev(), new[prefix..].bytes().rev())
             .take_while(|(x, y)| x == y)
             .count();
 
@@ -124,7 +119,7 @@ impl Source {
         let inner = Arc::make_mut(&mut self.0);
 
         // Update the text itself.
-        inner.text.update(|text| text.replace_range(replace.clone(), with));
+        inner.text.replace_range(replace.clone(), with);
 
         // Remove invalidated line starts.
         inner.lines.truncate(line + 1);
@@ -142,9 +137,7 @@ impl Source {
         ));
 
         // Incrementally reparse the replaced range.
-        inner
-            .root
-            .update(|root| reparse(root, &inner.text, replace, with.len()))
+        reparse(&mut inner.root, &inner.text, replace, with.len())
     }
 
     /// Get the length of the file in UTF-8 encoded bytes.
@@ -173,6 +166,8 @@ impl Source {
     /// Get the byte range for the given span in this file.
     ///
     /// Returns `None` if the span does not point into this source file.
+    ///
+    /// Typically, it's easier to use `WorldExt::range` instead.
     pub fn range(&self, span: Span) -> Option<Range<usize>> {
         Some(self.find(span)?.range())
     }

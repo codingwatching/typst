@@ -1,169 +1,212 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
+use ecow::eco_format;
 use image::{DynamicImage, GenericImageView, Rgba};
 use pdf_writer::{Chunk, Filter, Finish, Ref};
-use typst::util::Deferred;
-use typst::visualize::{
-    ColorSpace, Image, ImageKind, RasterFormat, RasterImage, SvgImage,
+use typst_library::diag::{At, SourceResult, StrResult};
+use typst_library::foundations::Smart;
+use typst_library::visualize::{
+    ColorSpace, ExchangeFormat, Image, ImageKind, ImageScaling, RasterFormat,
+    RasterImage, SvgImage,
 };
+use typst_utils::Deferred;
 
-use crate::{deflate, PdfContext};
+use crate::{color, deflate, PdfChunk, WithGlobalRefs};
+
+/// Embed all used images into the PDF.
+#[typst_macros::time(name = "write images")]
+pub fn write_images(
+    context: &WithGlobalRefs,
+) -> SourceResult<(PdfChunk, HashMap<Image, Ref>)> {
+    let mut chunk = PdfChunk::new();
+    let mut out = HashMap::new();
+    context.resources.traverse(&mut |resources| {
+        for (i, image) in resources.images.items().enumerate() {
+            if out.contains_key(image) {
+                continue;
+            }
+
+            let (handle, span) = resources.deferred_images.get(&i).unwrap();
+            let encoded = handle.wait().as_ref().map_err(Clone::clone).at(*span)?;
+
+            match encoded {
+                EncodedImage::Raster {
+                    data,
+                    filter,
+                    color_space,
+                    bits_per_component,
+                    width,
+                    height,
+                    compressed_icc,
+                    alpha,
+                    interpolate,
+                } => {
+                    let image_ref = chunk.alloc();
+                    out.insert(image.clone(), image_ref);
+
+                    let mut image = chunk.chunk.image_xobject(image_ref, data);
+                    image.filter(*filter);
+                    image.width(*width as i32);
+                    image.height(*height as i32);
+                    image.bits_per_component(i32::from(*bits_per_component));
+                    image.interpolate(*interpolate);
+
+                    let mut icc_ref = None;
+                    let space = image.color_space();
+                    if compressed_icc.is_some() {
+                        let id = chunk.alloc.bump();
+                        space.icc_based(id);
+                        icc_ref = Some(id);
+                    } else {
+                        color::write(
+                            *color_space,
+                            space,
+                            &context.globals.color_functions,
+                        );
+                    }
+
+                    // Add a second gray-scale image containing the alpha values if
+                    // this image has an alpha channel.
+                    if let Some((alpha_data, alpha_filter)) = alpha {
+                        let mask_ref = chunk.alloc.bump();
+                        image.s_mask(mask_ref);
+                        image.finish();
+
+                        let mut mask = chunk.image_xobject(mask_ref, alpha_data);
+                        mask.filter(*alpha_filter);
+                        mask.width(*width as i32);
+                        mask.height(*height as i32);
+                        mask.color_space().device_gray();
+                        mask.bits_per_component(i32::from(*bits_per_component));
+                        mask.interpolate(*interpolate);
+                    } else {
+                        image.finish();
+                    }
+
+                    if let (Some(compressed_icc), Some(icc_ref)) =
+                        (compressed_icc, icc_ref)
+                    {
+                        let mut stream = chunk.icc_profile(icc_ref, compressed_icc);
+                        stream.filter(Filter::FlateDecode);
+                        match color_space {
+                            ColorSpace::Srgb => {
+                                stream.n(3);
+                                stream.alternate().srgb();
+                            }
+                            ColorSpace::D65Gray => {
+                                stream.n(1);
+                                stream.alternate().d65_gray();
+                            }
+                            _ => unimplemented!(),
+                        }
+                    }
+                }
+                EncodedImage::Svg(svg_chunk, id) => {
+                    let mut map = HashMap::new();
+                    svg_chunk.renumber_into(&mut chunk.chunk, |old| {
+                        *map.entry(old).or_insert_with(|| chunk.alloc.bump())
+                    });
+                    out.insert(image.clone(), map[id]);
+                }
+            }
+        }
+
+        Ok(())
+    })?;
+
+    Ok((chunk, out))
+}
 
 /// Creates a new PDF image from the given image.
 ///
 /// Also starts the deferred encoding of the image.
 #[comemo::memoize]
-pub fn deferred_image(image: Image) -> Deferred<EncodedImage> {
-    Deferred::new(move || match image.kind() {
-        ImageKind::Raster(raster) => {
-            let raster = raster.clone();
-            let (width, height) = (raster.width(), raster.height());
-            let (data, filter, has_color) = encode_raster_image(&raster);
-            let icc = raster.icc().map(deflate);
-
-            let alpha =
-                raster.dynamic().color().has_alpha().then(|| encode_alpha(&raster));
-
-            EncodedImage::Raster { data, filter, has_color, width, height, icc, alpha }
+pub fn deferred_image(
+    image: Image,
+    pdfa: bool,
+) -> (Deferred<StrResult<EncodedImage>>, Option<ColorSpace>) {
+    let color_space = match image.kind() {
+        ImageKind::Raster(raster) if raster.icc().is_none() => {
+            Some(to_color_space(raster.dynamic().color()))
         }
-        ImageKind::Svg(svg) => EncodedImage::Svg(encode_svg(svg)),
-    })
+        _ => None,
+    };
+
+    // PDF/A does not appear to allow interpolation.
+    // See https://github.com/typst/typst/issues/2942.
+    let interpolate = !pdfa && image.scaling() == Smart::Custom(ImageScaling::Smooth);
+
+    let deferred = Deferred::new(move || match image.kind() {
+        ImageKind::Raster(raster) => Ok(encode_raster_image(raster, interpolate)),
+        ImageKind::Svg(svg) => {
+            let (chunk, id) = encode_svg(svg, pdfa)
+                .map_err(|err| eco_format!("failed to convert SVG to PDF: {err}"))?;
+            Ok(EncodedImage::Svg(chunk, id))
+        }
+    });
+
+    (deferred, color_space)
 }
 
-/// Embed all used images into the PDF.
-#[typst_macros::time(name = "write images")]
-pub(crate) fn write_images(ctx: &mut PdfContext) {
-    for (i, _) in ctx.image_map.items().enumerate() {
-        let handle = ctx.image_deferred_map.get(&i).unwrap();
-        match handle.wait() {
-            EncodedImage::Raster {
-                data,
-                filter,
-                has_color,
-                width,
-                height,
-                icc,
-                alpha,
-            } => {
-                let image_ref = ctx.alloc.bump();
-                ctx.image_refs.push(image_ref);
-
-                let mut image = ctx.pdf.image_xobject(image_ref, data);
-                image.filter(*filter);
-                image.width(*width as i32);
-                image.height(*height as i32);
-                image.bits_per_component(8);
-
-                let mut icc_ref = None;
-                let space = image.color_space();
-                if icc.is_some() {
-                    let id = ctx.alloc.bump();
-                    space.icc_based(id);
-                    icc_ref = Some(id);
-                } else if *has_color {
-                    ctx.colors.write(ColorSpace::Srgb, space, &mut ctx.alloc);
-                } else {
-                    ctx.colors.write(ColorSpace::D65Gray, space, &mut ctx.alloc);
-                }
-
-                // Add a second gray-scale image containing the alpha values if
-                // this image has an alpha channel.
-                if let Some((alpha_data, alpha_filter)) = alpha {
-                    let mask_ref = ctx.alloc.bump();
-                    image.s_mask(mask_ref);
-                    image.finish();
-
-                    let mut mask = ctx.pdf.image_xobject(mask_ref, alpha_data);
-                    mask.filter(*alpha_filter);
-                    mask.width(*width as i32);
-                    mask.height(*height as i32);
-                    mask.color_space().device_gray();
-                    mask.bits_per_component(8);
-                } else {
-                    image.finish();
-                }
-
-                if let (Some(icc), Some(icc_ref)) = (icc, icc_ref) {
-                    let mut stream = ctx.pdf.icc_profile(icc_ref, icc);
-                    stream.filter(Filter::FlateDecode);
-                    if *has_color {
-                        stream.n(3);
-                        stream.alternate().srgb();
-                    } else {
-                        stream.n(1);
-                        stream.alternate().d65_gray();
-                    }
-                }
-            }
-            EncodedImage::Svg(chunk) => {
-                let mut map = HashMap::new();
-                chunk.renumber_into(&mut ctx.pdf, |old| {
-                    *map.entry(old).or_insert_with(|| ctx.alloc.bump())
-                });
-                ctx.image_refs.push(map[&Ref::new(1)]);
-            }
-        }
-    }
-}
-
-/// Encode an image with a suitable filter and return the data, filter and
-/// whether the image has color.
-///
-/// Skips the alpha channel as that's encoded separately.
-fn encode_raster_image(image: &RasterImage) -> (Vec<u8>, Filter, bool) {
+/// Encode an image with a suitable filter.
+#[typst_macros::time(name = "encode raster image")]
+fn encode_raster_image(image: &RasterImage, interpolate: bool) -> EncodedImage {
     let dynamic = image.dynamic();
-    let channel_count = dynamic.color().channel_count();
-    let has_color = channel_count > 2;
+    let color_space = to_color_space(dynamic.color());
 
-    if image.format() == RasterFormat::Jpg {
-        let mut data = Cursor::new(vec![]);
-        dynamic.write_to(&mut data, image::ImageFormat::Jpeg).unwrap();
-        (data.into_inner(), Filter::DctDecode, has_color)
-    } else {
-        // TODO: Encode flate streams with PNG-predictor?
-        let data = match (dynamic, channel_count) {
-            (DynamicImage::ImageLuma8(luma), _) => deflate(luma.as_raw()),
-            (DynamicImage::ImageRgb8(rgb), _) => deflate(rgb.as_raw()),
-            // Grayscale image
-            (_, 1 | 2) => deflate(dynamic.to_luma8().as_raw()),
-            // Anything else
-            _ => deflate(dynamic.to_rgb8().as_raw()),
+    let (filter, data, bits_per_component) =
+        if image.format() == RasterFormat::Exchange(ExchangeFormat::Jpg) {
+            let mut data = Cursor::new(vec![]);
+            dynamic.write_to(&mut data, image::ImageFormat::Jpeg).unwrap();
+            (Filter::DctDecode, data.into_inner(), 8)
+        } else {
+            // TODO: Encode flate streams with PNG-predictor?
+            let (data, bits_per_component) = match (dynamic, color_space) {
+                // RGB image.
+                (DynamicImage::ImageRgb8(rgb), _) => (deflate(rgb.as_raw()), 8),
+                // Grayscale image
+                (DynamicImage::ImageLuma8(luma), _) => (deflate(luma.as_raw()), 8),
+                (_, ColorSpace::D65Gray) => (deflate(dynamic.to_luma8().as_raw()), 8),
+                // Anything else
+                _ => (deflate(dynamic.to_rgb8().as_raw()), 8),
+            };
+            (Filter::FlateDecode, data, bits_per_component)
         };
-        (data, Filter::FlateDecode, has_color)
+
+    let compressed_icc = image.icc().map(|data| deflate(data));
+    let alpha = dynamic.color().has_alpha().then(|| encode_alpha(dynamic));
+
+    EncodedImage::Raster {
+        data,
+        filter,
+        color_space,
+        bits_per_component,
+        width: image.width(),
+        height: image.height(),
+        compressed_icc,
+        alpha,
+        interpolate,
     }
 }
 
 /// Encode an image's alpha channel if present.
-fn encode_alpha(raster: &RasterImage) -> (Vec<u8>, Filter) {
-    let pixels: Vec<_> = raster
-        .dynamic()
-        .pixels()
-        .map(|(_, _, Rgba([_, _, _, a]))| a)
-        .collect();
+#[typst_macros::time(name = "encode alpha")]
+fn encode_alpha(image: &DynamicImage) -> (Vec<u8>, Filter) {
+    let pixels: Vec<_> = image.pixels().map(|(_, _, Rgba([_, _, _, a]))| a).collect();
     (deflate(&pixels), Filter::FlateDecode)
 }
 
 /// Encode an SVG into a chunk of PDF objects.
-///
-/// The main XObject will have ID 1.
-fn encode_svg(svg: &SvgImage) -> Chunk {
-    let mut chunk = Chunk::new();
-
-    // Safety: We do not keep any references to tree nodes beyond the
-    // scope of `with`.
-    unsafe {
-        svg.with(|tree| {
-            svg2pdf::convert_tree_into(
-                tree,
-                svg2pdf::Options::default(),
-                &mut chunk,
-                Ref::new(1),
-            );
-        });
-    }
-
-    chunk
+#[typst_macros::time(name = "encode svg")]
+fn encode_svg(
+    svg: &SvgImage,
+    pdfa: bool,
+) -> Result<(Chunk, Ref), svg2pdf::ConversionError> {
+    svg2pdf::to_chunk(
+        svg.tree(),
+        svg2pdf::ConversionOptions { pdfa, ..Default::default() },
+    )
 }
 
 /// A pre-encoded image.
@@ -174,19 +217,33 @@ pub enum EncodedImage {
         data: Vec<u8>,
         /// The filter to use for the image.
         filter: Filter,
-        /// Whether the image has color.
-        has_color: bool,
+        /// Which color space this image is encoded in.
+        color_space: ColorSpace,
+        /// How many bits of each color component are stored.
+        bits_per_component: u8,
         /// The image's width.
         width: u32,
         /// The image's height.
         height: u32,
-        /// The image's ICC profile, pre-deflated, if any.
-        icc: Option<Vec<u8>>,
+        /// The image's ICC profile, deflated, if any.
+        compressed_icc: Option<Vec<u8>>,
         /// The alpha channel of the image, pre-deflated, if any.
         alpha: Option<(Vec<u8>, Filter)>,
+        /// Whether image interpolation should be enabled.
+        interpolate: bool,
     },
     /// A vector graphic.
     ///
     /// The chunk is the SVG converted to PDF objects.
-    Svg(Chunk),
+    Svg(Chunk, Ref),
+}
+
+/// Matches an [`image::ColorType`] to [`ColorSpace`].
+fn to_color_space(color: image::ColorType) -> ColorSpace {
+    use image::ColorType::*;
+    match color {
+        L8 | La8 | L16 | La16 => ColorSpace::D65Gray,
+        Rgb8 | Rgba8 | Rgb16 | Rgba16 | Rgb32F | Rgba32F => ColorSpace::Srgb,
+        _ => unimplemented!(),
+    }
 }
